@@ -1,0 +1,17 @@
+{
+  "name": "yt-short-uploader-exceljs",
+  "version": "1.2.0",
+  "description": "Upload and schedule YouTube videos using metadata from a local Excel (.xlsx) file (uses exceljs)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "hendrix0420",
+  "license": "MIT",
+  "dependencies": {
+    "exceljs": "^4.3.0",
+    "googleapis": "^131.0.0",
+    "inquirer": "^9.2.7",
+    "open": "^9.0.0"
+  }
+}
