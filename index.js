@@ -1,14 +1,18 @@
 /**
- * index.js (patched)
+ * index.js (scheduling update)
  * 使用 exceljs 讀寫本機 Excel 並透過 YouTube Data API 上傳影片（可排程）
  *
- * 修正說明：
- * - 處理 inquirer.prompt 可能不存在的狀況：建立一個容錯的 prompt 介面 (createPromptModule 或 fallback)
+ * 這個版本新增更友善的排程選項：
+ * - 立即公開（default）
+ * - 起始時間 + 每支影片間隔（start + interval）
+ * - 每日固定時間發佈 N 支影片（daily schedule），可設定起始日期、每天幾支、以及同日內影片之間的間隔分鐘數
  *
  * 需求：
  *  - credentials.json (Google OAuth desktop client) 放在專案根目錄 (若要上傳)
  *  - npm install
  *  - node index.js
+ *
+ * 已包含先前對 inquirer.createPromptModule 的容錯處理。
  */
 
 const fs = require('fs');
@@ -18,22 +22,20 @@ const inquirer = require('inquirer');
 const open = require('open');
 const ExcelJS = require('exceljs');
 
-// Create a robust prompt function that works with different inquirer exports
+// robust prompt init (works with multiple inquirer builds)
 let prompt;
 try {
   if (typeof inquirer.createPromptModule === 'function') {
     prompt = inquirer.createPromptModule();
   } else if (typeof inquirer.prompt === 'function') {
-    // some inquirer builds export prompt directly
     prompt = (...args) => inquirer.prompt(...args);
   } else {
     throw new Error('inquirer has no createPromptModule or prompt export');
   }
 } catch (e) {
-  // Provide a helpful message if inquirer seems wrong (e.g., name collision with local file)
   throw new Error(
-    '無法初始化 inquirer 的 prompt 函式。請檢查你是否意外在專案中建立了 inquirer.js 或資料夾，' +
-    '或檢查 node_modules 是否正確安裝。錯誤細節: ' + e.message
+    '無法初始化 inquirer 的 prompt 函式。請檢查是否有本地檔案或資料夾名稱為 inquirer，或 node_modules 是否正確安裝。錯誤: ' +
+    e.message
   );
 }
 
@@ -144,6 +146,38 @@ async function writeArrayOfArraysToSheetAndSave(workbook, worksheet, values, exc
   await workbook.xlsx.writeFile(excelPath);
 }
 
+/**
+ * Compute publishAt (ISO string) for the next scheduled video, based on scheduleOptions.
+ * scheduledIndex: zero-based index of this upload among uploads that receive scheduling (0,1,2,...)
+ *
+ * scheduleOptions structure:
+ * - type: 'none' | 'start_interval' | 'daily'
+ * - for start_interval:
+ *    { type:'start_interval', startAt: Date, intervalMins: number }
+ * - for daily:
+ *    { type:'daily', startDate: 'YYYY-MM-DD', timeOfDay: 'HH:MM' (24h), perDay: number, spacingMins: number }
+ */
+function computePublishAtForIndex(scheduledIndex, scheduleOptions) {
+  if (!scheduleOptions || scheduleOptions.type === 'none') return null;
+  if (scheduleOptions.type === 'start_interval') {
+    const dt = new Date(scheduleOptions.startAt.getTime() + scheduledIndex * scheduleOptions.intervalMins * 60 * 1000);
+    return dt.toISOString();
+  }
+  if (scheduleOptions.type === 'daily') {
+    const { startDate, timeOfDay, perDay, spacingMins } = scheduleOptions;
+    // parse startDate + timeOfDay as local time
+    const [hourStr, minStr] = timeOfDay.split(':');
+    const [year, month, day] = startDate.split('-').map(Number);
+    const base = new Date(year, month - 1, day, Number(hourStr), Number(minStr), 0, 0); // local
+    const dayOffset = Math.floor(scheduledIndex / perDay);
+    const indexInDay = scheduledIndex % perDay;
+    // add dayOffset days
+    const dt = new Date(base.getTime() + dayOffset * 24 * 60 * 60 * 1000 + indexInDay * spacingMins * 60 * 1000);
+    return dt.toISOString();
+  }
+  return null;
+}
+
 async function main() {
   try {
     const basicAnswers = await prompt([
@@ -183,37 +217,76 @@ async function main() {
       }
     ]);
 
-    let scheduleOptions = null;
-    if (basicAnswers.doUpload) {
-      const s2 = await prompt([
+    // scheduling strategy selection
+    const scheduleChoice = await prompt([
+      {
+        type: 'list',
+        name: 'scheduleType',
+        message: '選擇影片發布（publishAt）排程方式：',
+        choices: [
+          { name: '立即公開（不排程）', value: 'none' },
+          { name: '指定起始時間，之後每支影片間隔固定分鐘數', value: 'start_interval' },
+          { name: '每天固定時間發佈 N 支影片（可設定同日內間隔）', value: 'daily' }
+        ],
+        default: 'none'
+      }
+    ]);
+
+    let scheduleOptions = { type: 'none' };
+    if (scheduleChoice.scheduleType === 'start_interval') {
+      const s = await prompt([
         {
-          type: 'confirm',
-          name: 'enableSchedule',
-          message: '是否啟用排程 publish（否則會直接公開）?',
-          default: true
+          name: 'startAt',
+          message: '排程起始時間 (ISO 8601，本地或帶Z皆可，例如 2025-11-22T10:00:00 或 2025-11-22T10:00:00Z)：',
+          default: new Date(Date.now() + 5 * 60 * 1000).toISOString().replace(/\.\d+Z$/, 'Z')
+        },
+        {
+          name: 'intervalMins',
+          message: '每支影片間隔 (分鐘)：',
+          default: 10,
+          validate: v => (!isNaN(Number(v)) && Number(v) >= 0) ? true : '請輸入數字'
         }
       ]);
-      if (s2.enableSchedule) {
-        const s3 = await prompt([
-          {
-            name: 'startAt',
-            message: '排程起始時間 (ISO 8601, 例如 2025-11-22T10:00:00Z)：',
-            default: new Date(Date.now() + 5 * 60 * 1000).toISOString().replace(/\.\d+Z$/, 'Z')
-          },
-          {
-            name: 'intervalMins',
-            message: '每支影片間隔 (分鐘)：',
-            default: 10,
-            validate: v => (!isNaN(Number(v)) && Number(v) >= 0) ? true : '請輸入數字'
-          }
-        ]);
-        scheduleOptions = {
-          startAt: new Date(s3.startAt),
-          intervalMins: Number(s3.intervalMins)
-        };
-      }
+      scheduleOptions = {
+        type: 'start_interval',
+        startAt: new Date(s.startAt),
+        intervalMins: Number(s.intervalMins)
+      };
+    } else if (scheduleChoice.scheduleType === 'daily') {
+      const d = await prompt([
+        {
+          name: 'startDate',
+          message: '排程起始日期 (YYYY-MM-DD)：',
+          default: new Date().toISOString().slice(0, 10)
+        },
+        {
+          name: 'timeOfDay',
+          message: '每天的發佈時間 (24h HH:MM，例如 10:00)：',
+          default: '10:00',
+          validate: v => /^\d{1,2}:\d{2}$/.test(v) ? true : '格式應為 HH:MM'
+        },
+        {
+          name: 'perDay',
+          message: '每天要發佈幾支影片 (整數 > 0)：',
+          default: 1,
+          validate: v => (Number.isInteger(Number(v)) && Number(v) > 0) ? true : '請輸入正整數'
+        },
+        {
+          name: 'spacingMins',
+          message: '同日內多支影片間隔分鐘數（若每天 >1 支，建議至少 1）：',
+          default: 1,
+          validate: v => (!isNaN(Number(v)) && Number(v) >= 0) ? true : '請輸入數字'
+        }
+      ]);
+      scheduleOptions = {
+        type: 'daily',
+        startDate: d.startDate,
+        timeOfDay: d.timeOfDay,
+        perDay: Number(d.perDay),
+        spacingMins: Number(d.spacingMins)
+      };
     } else {
-      scheduleOptions = null;
+      scheduleOptions = { type: 'none' };
     }
 
     const excelPath = path.resolve(basicAnswers.excelPath);
@@ -259,6 +332,9 @@ async function main() {
       youtube = google.youtube({ version: 'v3', auth });
     }
 
+    // scheduledCount counts how many uploads (or simulations) we've scheduled so far
+    let scheduledCount = 0;
+
     for (let r = 1; r < values.length; r++) {
       const row = values[r] || [];
       const idCell = row[idColIndex];
@@ -287,12 +363,8 @@ async function main() {
       if (hashtags) description += `\n\n${hashtags.toString()}`;
       const tags = tagsRaw ? tagsRaw.toString().split(',').map(t => t.trim()).filter(Boolean) : [];
 
-      let publishAt = null;
-      if (scheduleOptions) {
-        const offsetMinutes = (r - 1) * scheduleOptions.intervalMins;
-        const dt = new Date(scheduleOptions.startAt.getTime() + offsetMinutes * 60 * 1000);
-        publishAt = dt.toISOString();
-      }
+      // compute publishAt based on scheduledCount (only count items that we actually attempt to upload)
+      const publishAt = computePublishAtForIndex(scheduledCount, scheduleOptions);
 
       console.log(`處理 第 ${r + 1} 列 編號=${baseName} 檔案=${videoPath}`);
       console.log(`  Title: ${title}`);
@@ -301,11 +373,14 @@ async function main() {
       if (!basicAnswers.doUpload) {
         const timestamp = (new Date()).toISOString();
         values[r] = values[r] || [];
-        values[r][uploadedColIndex] = `${timestamp} | SIMULATED | file: ${path.basename(videoPath)}`;
+        values[r][uploadedColIndex] = `${timestamp} | SIMULATED | file: ${path.basename(videoPath)} | publishAt: ${publishAt || 'NOW'}`;
         console.log(`  模擬完成（未上傳）`);
+        // increment scheduledCount only if scheduling applied (count simulation as scheduled action)
+        if (scheduleOptions && scheduleOptions.type !== 'none') scheduledCount++;
         continue;
       }
 
+      // perform upload
       try {
         const res = await youtube.videos.insert({
           part: ['snippet', 'status'],
@@ -320,11 +395,15 @@ async function main() {
 
         const timestamp = (new Date()).toISOString();
         values[r] = values[r] || [];
-        values[r][uploadedColIndex] = `${timestamp} | videoId: ${videoId}`;
+        values[r][uploadedColIndex] = `${timestamp} | videoId: ${videoId} | publishAt: ${publishAt || 'NOW'}`;
+
+        // increment scheduledCount after successful scheduling/upload
+        if (scheduleOptions && scheduleOptions.type !== 'none') scheduledCount++;
       } catch (err) {
         console.error(`  第 ${r + 1} 列上傳失敗：`, (err && err.errors) ? err.errors : (err && err.message) ? err.message : err);
         values[r] = values[r] || [];
         values[r][uploadedColIndex] = `ERROR: ${(err && err.message) ? err.message : 'upload failed'}`;
+        // do not increment scheduledCount on failure (so next video will reuse same scheduled slot)
       }
     }
 
